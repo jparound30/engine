@@ -98,6 +98,21 @@ static gboolean fl_renderer_real_start(FlRenderer* self, GError** error) {
     return FALSE;
   }
 
+  if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+    g_set_error(error, fl_renderer_error_quark(), FL_RENDERER_ERROR_FAILED,
+                "Failed to bind EGL OpenGL ES API: %s", get_egl_error());
+    return FALSE;
+  }
+
+  // This is a workaround for NVidia's proprietary Linux driver.
+  // The driver returns several EGL framebuffer configurations with exactly
+  // the same attributes.
+  // However, some EGLconfigs that have exactly the same attributes succeed
+  // and some fail to create the surface.
+  // There seems to be no way to determine this successful EGL config.
+  // So first, get count of EGL config that match specified attributes.
+  // Then call create_surface with each EGL config until it succeeds.
+  // If it finds a successfull EGL config, use that EGL config.
   EGLint attributes[] = {EGL_RENDERABLE_TYPE,
                          EGL_OPENGL_ES2_BIT,
                          EGL_RED_SIZE,
@@ -109,9 +124,9 @@ static gboolean fl_renderer_real_start(FlRenderer* self, GError** error) {
                          EGL_ALPHA_SIZE,
                          8,
                          EGL_NONE};
-  EGLConfig egl_config;
-  EGLint n_config;
-  if (!eglChooseConfig(priv->egl_display, attributes, &egl_config, 1,
+  EGLint n_config = 0;
+
+  if (!eglChooseConfig(priv->egl_display, attributes, nullptr, 0,
                        &n_config)) {
     g_set_error(error, fl_renderer_error_quark(), FL_RENDERER_ERROR_FAILED,
                 "Failed to choose EGL config: %s", get_egl_error());
@@ -122,21 +137,32 @@ static gboolean fl_renderer_real_start(FlRenderer* self, GError** error) {
                 "Failed to find appropriate EGL config: %s", get_egl_error());
     return FALSE;
   }
-  if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+  EGLConfig *egl_config = new EGLConfig[n_config];
+  if (!eglChooseConfig(priv->egl_display, attributes, egl_config, n_config,
+                       &n_config)) {
+    delete[] egl_config;
     g_set_error(error, fl_renderer_error_quark(), FL_RENDERER_ERROR_FAILED,
-                "Failed to bind EGL OpenGL ES API: %s", get_egl_error());
+                "Failed to choose EGL config: %s", get_egl_error());
     return FALSE;
+  }
+  EGLConfig ok_config;
+  for (int i = 0; i < n_config; ++i) {
+    priv->egl_surface = FL_RENDERER_GET_CLASS(self)->create_surface(
+        self, priv->egl_display, egl_config[i]);
+    if (priv->egl_surface != nullptr) {
+      ok_config = egl_config[i];
+      break;
+    }
+  }
+  delete[] egl_config;
+  if (priv->egl_surface == nullptr) {
+      g_set_error(error, fl_renderer_error_quark(), FL_RENDERER_ERROR_FAILED,
+                  "Failed to create EGL surface: %s", get_egl_error());
+      return FALSE;
   }
 
-  priv->egl_surface = FL_RENDERER_GET_CLASS(self)->create_surface(
-      self, priv->egl_display, egl_config);
-  if (priv->egl_surface == nullptr) {
-    g_set_error(error, fl_renderer_error_quark(), FL_RENDERER_ERROR_FAILED,
-                "Failed to create EGL surface: %s", get_egl_error());
-    return FALSE;
-  }
   EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-  priv->egl_context = eglCreateContext(priv->egl_display, egl_config,
+  priv->egl_context = eglCreateContext(priv->egl_display, ok_config,
                                        EGL_NO_CONTEXT, context_attributes);
   if (priv->egl_context == nullptr) {
     g_set_error(error, fl_renderer_error_quark(), FL_RENDERER_ERROR_FAILED,
@@ -144,7 +170,7 @@ static gboolean fl_renderer_real_start(FlRenderer* self, GError** error) {
     return FALSE;
   }
 
-  create_resource_surface(self, egl_config);
+  create_resource_surface(self, ok_config);
 
   EGLint value;
   eglQueryContext(priv->egl_display, priv->egl_context,
